@@ -1,0 +1,399 @@
+import sys
+import os
+import time
+import shlex
+
+DATA_FILE = "data.db"
+
+
+class KeyValuePair:
+    """Stores key, value, and optional expiration timestamp."""
+    def __init__(self, key, value, expire_at=None):
+        self.key = key
+        self.value = value
+        self.expire_at = expire_at
+
+
+class CustomKVStore:
+    """
+    Custom in-memory index using lists of KeyValuePair objects.
+    Enforces 'last write wins' without built-in dict primitives.
+    """
+    def __init__(self):
+        self.store = []
+        self.hashes = []
+        self.lists = []
+        self.tx_store = None
+        self.tx_hashes = None
+        self.tx_lists = None
+
+    def _cleanup_expired(self):
+        now = time.time()
+        self.store = [item for item in self.store if item.expire_at is None or item.expire_at > now]
+
+    def _find_index(self, key, target_list=None):
+        lst = self.store if target_list is None else target_list
+        for i, item in enumerate(lst):
+            if item.key == key:
+                return i
+        return -1
+
+    def get(self, key):
+        self._cleanup_expired()
+        target = self.tx_store if self.tx_store is not None else self.store
+        idx = self._find_index(key, target)
+        if idx != -1:
+            return target[idx].value
+        return None
+
+    def set(self, key, value, expire_at=None):
+        target = self.tx_store if self.tx_store is not None else self.store
+        idx = self._find_index(key, target)
+        if idx != -1:
+            target[idx].value = value
+            target[idx].expire_at = expire_at
+        else:
+            target.append(KeyValuePair(key, value, expire_at))
+
+    def delete(self, key):
+        target = self.tx_store if self.tx_store is not None else self.store
+        idx = self._find_index(key, target)
+        if idx != -1:
+            target.pop(idx)
+            return True
+        return False
+
+    def exists(self, key):
+        self._cleanup_expired()
+        target = self.tx_store if self.tx_store is not None else self.store
+        return self._find_index(key, target) != -1
+
+    def expire(self, key, seconds):
+        self._cleanup_expired()
+        target = self.tx_store if self.tx_store is not None else self.store
+        idx = self._find_index(key, target)
+        if idx != -1:
+            target[idx].expire_at = time.time() + float(seconds)
+            return 1
+        return 0
+
+    def ttl(self, key):
+        self._cleanup_expired()
+        target = self.tx_store if self.tx_store is not None else self.store
+        idx = self._find_index(key, target)
+        if idx != -1:
+            item = target[idx]
+            if item.expire_at is None:
+                return -1
+            remaining = int(item.expire_at - time.time())
+            return remaining if remaining > 0 else -2
+        return -2
+
+    def range_query(self, start_key, end_key):
+        self._cleanup_expired()
+        target = self.tx_store if self.tx_store is not None else self.store
+        matched = [item.key for item in target if start_key <= item.key <= end_key]
+        matched.sort()
+        return matched
+
+    # --- Hashes ---
+    def _get_hash_list(self, hname):
+        target = self.tx_hashes if self.tx_hashes is not None else self.hashes
+        for name, fields in target:
+            if name == hname:
+                return fields
+        new_fields = []
+        target.append((hname, new_fields))
+        return new_fields
+
+    def hset(self, hname, key, value):
+        fields = self._get_hash_list(hname)
+        idx = self._find_index(key, fields)
+        if idx != -1:
+            fields[idx].value = value
+        else:
+            fields.append(KeyValuePair(key, value))
+
+    def hget(self, hname, key):
+        target = self.tx_hashes if self.tx_hashes is not None else self.hashes
+        for name, fields in target:
+            if name == hname:
+                idx = self._find_index(key, fields)
+                if idx != -1:
+                    return fields[idx].value
+        return None
+
+    def hgetall(self, hname):
+        target = self.tx_hashes if self.tx_hashes is not None else self.hashes
+        for name, fields in target:
+            if name == hname:
+                res = []
+                for item in fields:
+                    res.extend([item.key, item.value])
+                return res
+        return []
+
+    # --- Lists ---
+    def _get_list(self, lname):
+        target = self.tx_lists if self.tx_lists is not None else self.lists
+        for name, lst in target:
+            if name == lname:
+                return lst
+        new_lst = []
+        target.append((lname, new_lst))
+        return new_lst
+
+    def lpush(self, lname, values):
+        lst = self._get_list(lname)
+        for v in values:
+            lst.insert(0, v)
+
+    def rpush(self, lname, values):
+        lst = self._get_list(lname)
+        for v in values:
+            lst.append(v)
+
+    def lrange(self, lname, start, stop):
+        target = self.tx_lists if self.tx_lists is not None else self.lists
+        for name, lst in target:
+            if name == lname:
+                s = int(start)
+                e = int(stop)
+                if e == -1 or e >= len(lst):
+                    return lst[s:]
+                return lst[s:e + 1]
+        return []
+
+    # --- Transactions ---
+    def begin(self):
+        self.tx_store = [KeyValuePair(i.key, i.value, i.expire_at) for i in self.store]
+        self.tx_hashes = [(n, [KeyValuePair(i.key, i.value) for i in f]) for n, f in self.hashes]
+        self.tx_lists = [(n, list(l)) for n, l in self.lists]
+
+    def commit(self):
+        if self.tx_store is not None:
+            self.store = self.tx_store
+            self.hashes = self.tx_hashes
+            self.lists = self.tx_lists
+            self.tx_store = None
+            self.tx_hashes = None
+            self.tx_lists = None
+            return True
+        return False
+
+    def abort(self):
+        if self.tx_store is not None:
+            self.tx_store = None
+            self.tx_hashes = None
+            self.tx_lists = None
+            return True
+        return False
+
+    def flush(self):
+        self.store = []
+        self.hashes = []
+        self.lists = []
+        self.tx_store = None
+        self.tx_hashes = None
+        self.tx_lists = None
+
+
+class DatabaseEngine:
+    """Handles command processing, log persistence, and output formatting."""
+    def __init__(self, filename=DATA_FILE):
+        self.filename = filename
+        self.kv = CustomKVStore()
+        self.replay_log()
+
+    def append_log(self, command_line):
+        with open(self.filename, "a") as f:
+            f.write(command_line.strip() + "\n")
+
+    def replay_log(self):
+        if not os.path.exists(self.filename):
+            return
+        with open(self.filename, "r") as f:
+            for line in f:
+                line_str = line.strip()
+                if not line_str:
+                    continue
+                try:
+                    parts = shlex.split(line_str)
+                except Exception:
+                    parts = line_str.split()
+                if not parts:
+                    continue
+                cmd = parts[0].upper()
+                if cmd == "SET" and len(parts) >= 3:
+                    self.kv.set(parts[1], parts[2])
+                elif cmd == "DEL" and len(parts) >= 2:
+                    self.kv.delete(parts[1])
+                elif cmd == "MSET" and len(parts) >= 3:
+                    for i in range(1, len(parts) - 1, 2):
+                        self.kv.set(parts[i], parts[i + 1])
+                elif cmd == "HSET" and len(parts) >= 4:
+                    self.kv.hset(parts[1], parts[2], parts[3])
+                elif cmd == "LPUSH" and len(parts) >= 3:
+                    self.kv.lpush(parts[1], parts[2:])
+                elif cmd == "RPUSH" and len(parts) >= 3:
+                    self.kv.rpush(parts[1], parts[2:])
+                elif cmd == "FLUSHDB":
+                    self.kv.flush()
+
+    def process_command(self, line):
+        line_str = line.strip()
+        if not line_str:
+            return
+
+        try:
+            parts = shlex.split(line_str)
+        except Exception:
+            parts = line_str.split()
+
+        if not parts:
+            return
+
+        cmd = parts[0].upper()
+
+        if cmd == "SET" and len(parts) >= 3:
+            self.kv.set(parts[1], parts[2])
+            self.append_log(f'SET "{parts[1]}" "{parts[2]}"')
+            print("OK", flush=True)
+
+        elif cmd == "GET" and len(parts) >= 2:
+            val = self.kv.get(parts[1])
+            if val is not None:
+                print(val, flush=True)
+            else:
+                print("", flush=True)
+
+        elif cmd == "DEL" and len(parts) >= 2:
+            if self.kv.delete(parts[1]):
+                self.append_log(f'DEL "{parts[1]}"')
+                print("1", flush=True)
+            else:
+                print("0", flush=True)
+
+        elif cmd == "EXISTS" and len(parts) >= 2:
+            print("1" if self.kv.exists(parts[1]) else "0", flush=True)
+
+        elif cmd == "MSET":
+            pairs = parts[1:]
+            if len(pairs) % 2 == 0:
+                for i in range(0, len(pairs), 2):
+                    self.kv.set(pairs[i], pairs[i + 1])
+                self.append_log(line_str)
+                print("OK", flush=True)
+
+        elif cmd == "MGET":
+            keys = parts[1:]
+            for k in keys:
+                v = self.kv.get(k)
+                print(v if v is not None else "", flush=True)
+
+        elif cmd == "EXPIRE" and len(parts) >= 3:
+            print(self.kv.expire(parts[1], parts[2]), flush=True)
+
+        elif cmd == "TTL" and len(parts) >= 2:
+            print(self.kv.ttl(parts[1]), flush=True)
+
+        elif cmd == "RANGE" and len(parts) >= 3:
+            res = self.kv.range_query(parts[1], parts[2])
+            for k in res:
+                print(k, flush=True)
+
+        elif cmd == "HSET" and len(parts) >= 4:
+            self.kv.hset(parts[1], parts[2], parts[3])
+            self.append_log(line_str)
+            print("OK", flush=True)
+
+        elif cmd == "HGET" and len(parts) >= 3:
+            val = self.kv.hget(parts[1], parts[2])
+            if val is not None:
+                print(val, flush=True)
+            else:
+                print("", flush=True)
+
+        elif cmd == "HGETALL" and len(parts) >= 2:
+            res = self.kv.hgetall(parts[1])
+            for item in res:
+                print(item, flush=True)
+
+        elif cmd == "LPUSH" and len(parts) >= 3:
+            self.kv.lpush(parts[1], parts[2:])
+            self.append_log(line_str)
+            print("OK", flush=True)
+
+        elif cmd == "RPUSH" and len(parts) >= 3:
+            self.kv.rpush(parts[1], parts[2:])
+            self.append_log(line_str)
+            print("OK", flush=True)
+
+        elif cmd == "LRANGE" and len(parts) >= 4:
+            res = self.kv.lrange(parts[1], parts[2], parts[3])
+            for item in res:
+                print(item, flush=True)
+
+        elif cmd == "INCR" and len(parts) >= 2:
+            val = self.kv.get(parts[1]) or "0"
+            try:
+                new_val = str(int(val) + 1)
+                self.kv.set(parts[1], new_val)
+                self.append_log(f'SET "{parts[1]}" "{new_val}"')
+                print(new_val, flush=True)
+            except ValueError:
+                print("ERR value is not an integer", flush=True)
+
+        elif cmd == "DECR" and len(parts) >= 2:
+            val = self.kv.get(parts[1]) or "0"
+            try:
+                new_val = str(int(val) - 1)
+                self.kv.set(parts[1], new_val)
+                self.append_log(f'SET "{parts[1]}" "{new_val}"')
+                print(new_val, flush=True)
+            except ValueError:
+                print("ERR value is not an integer", flush=True)
+
+        elif cmd == "BEGIN":
+            self.kv.begin()
+            print("OK", flush=True)
+
+        elif cmd == "COMMIT":
+            if self.kv.commit():
+                self.append_log(line_str)
+                print("OK", flush=True)
+            else:
+                print("ERR No transaction", flush=True)
+
+        elif cmd == "ABORT":
+            if self.kv.abort():
+                print("OK", flush=True)
+            else:
+                print("ERR No transaction", flush=True)
+
+        elif cmd == "FLUSHDB":
+            self.kv.flush()
+            if os.path.exists(self.filename):
+                open(self.filename, "w").close()
+            print("OK", flush=True)
+
+        elif cmd == "EXIT":
+            sys.exit(0)
+
+        else:
+            print("ERR unknown command", flush=True)
+
+
+def main():
+    """Reads lines from standard input and processes commands continuously."""
+    db = DatabaseEngine()
+    for line in sys.stdin:
+        if not line.strip():
+            continue
+        db.process_command(line)
+
+
+if __name__ == "__main__":
+    main()
+ sys
+im
